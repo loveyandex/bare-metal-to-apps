@@ -1,0 +1,6 @@
+# Rust
+/backend/target
+/backend/.env
+
+# OS
+.DS_Store

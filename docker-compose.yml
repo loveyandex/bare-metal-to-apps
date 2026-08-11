@@ -1,0 +1,20 @@
+version: "3.8"
+
+# Runs the PaaS control-plane's own Postgres database (state storage), not to
+# be confused with the per-project databases the platform provisions for
+# users' apps — those are run directly via the backend's Docker orchestrator.
+services:
+  control-plane-db:
+    image: postgres:16-alpine
+    container_name: paas-control-plane-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: paas
+    ports:
+      - "5433:5432"
+    volumes:
+      - paas_control_plane_data:/var/lib/postgresql/data
+
+volumes:
+  paas_control_plane_data:
