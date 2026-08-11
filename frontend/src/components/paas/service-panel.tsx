@@ -286,7 +286,9 @@ function ServicePanelContent({
                     />
                   </div>
                   <div className="flex-1">
-                    <Label className="mb-1 block normal-case">{deployMode === "kubernetes" ? "NodePort (30000-32767)" : "Host port"}</Label>
+                    <Label className="mb-1 block normal-case">
+                      {deployMode === "kubernetes" ? "Forward to localhost port" : "Host port"}
+                    </Label>
                     <Input
                       type="number"
                       placeholder="internal only"
@@ -319,14 +321,13 @@ function ServicePanelContent({
 
           {deployMode === "kubernetes" && (
             <p className="mt-3 text-xs text-muted">
-              On a local <code className="rounded bg-surface-2 px-1 py-0.5">kind</code> cluster, a
-              NodePort isn&apos;t automatically reachable at <code className="rounded bg-surface-2 px-1 py-0.5">localhost</code>.
-              Either add an <code className="rounded bg-surface-2 px-1 py-0.5">extraPortMappings</code> entry when
-              creating the cluster, or run{" "}
-              <code className="rounded bg-surface-2 px-1 py-0.5">
-                kubectl port-forward svc/{service.slug} &lt;port&gt;:&lt;port&gt;
-              </code>
-              .
+              The backend runs a <code className="rounded bg-surface-2 px-1 py-0.5">kubectl port-forward</code>{" "}
+              for you when you set this, so it&apos;s reachable at{" "}
+              <code className="rounded bg-surface-2 px-1 py-0.5">localhost:&lt;port&gt;</code> even on a plain
+              local <code className="rounded bg-surface-2 px-1 py-0.5">kind</code> cluster with no{" "}
+              <code className="rounded bg-surface-2 px-1 py-0.5">extraPortMappings</code>. The Service also
+              gets a matching NodePort if the port is in the 30000-32767 range, for clusters that route
+              NodePorts directly.
             </p>
           )}
         </TabsPanel>
