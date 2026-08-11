@@ -2,8 +2,10 @@
 
 A minimal, self-hosted Railway-style PaaS: create a project, add services from
 a Docker image or a one-click database, link them with env vars, and watch
-status flip from "Deploying" to "Running" live. v0 runs on your local Docker
-daemon; see `docs/PLAN.md` for the roadmap to multi-node Kubernetes.
+status flip from "Deploying" to "Running" live. Each project picks its deploy
+target at creation time — your local Docker daemon, or a Kubernetes cluster
+reachable via `kubectl` (a local `kind` cluster works) — see `docs/PLAN.md`
+for the full roadmap.
 
 ## Layout
 
@@ -57,4 +59,23 @@ a Docker image (e.g. `ghcr.io/love-solana/sqlx:v1.0.13`, or `hello-world` to
 try it without a real app) or a one-click database (Postgres/Redis/MySQL/
 MongoDB — credentials are generated automatically and hidden behind a reveal
 button). Link services by setting an env var value like
-`${{postgres.DATABASE_URL}}` on another service.
+`${{postgres.DATABASE_URL}}` on another service. A service's Networking tab
+lets you publish a container port (host port in Docker mode, NodePort in
+Kubernetes mode) — applying it redeploys the service.
+
+### Kubernetes mode
+
+Pick "Kubernetes" instead of "Docker" when creating a project and the
+backend deploys that project's services as Deployments (+ a Service each)
+in their own Namespace, using whatever `kubectl` on the backend's PATH is
+currently configured against — e.g. a local `kind` cluster:
+
+```bash
+kind create cluster --config docs/kind-config.yaml
+kubectl get nodes   # sanity check — should show 4 nodes
+```
+
+No extra Kubernetes client dependency is needed — the backend just shells
+out to `kubectl`. NodePorts on `kind` aren't reachable at `localhost` unless
+the cluster was created with a matching `extraPortMappings` entry; otherwise
+use `kubectl port-forward svc/<service-slug> <port>:<port> -n <project-slug>`.

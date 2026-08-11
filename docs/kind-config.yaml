@@ -1,0 +1,23 @@
+# Example 4-node kind cluster for local Kubernetes-mode projects.
+#
+#   kind create cluster --config docs/kind-config.yaml
+#
+# extraPortMappings makes NodePorts you publish from a service's Networking
+# tab reachable at localhost without `kubectl port-forward`. Add one entry
+# per NodePort you plan to use (or a wide range, if your kind version
+# supports it) — kind can't map ports it wasn't told about at cluster
+# creation time.
+apiVersion: kind.x-k8s.io/v1alpha4
+kind: Cluster
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 30080
+        protocol: TCP
+      - containerPort: 30081
+        hostPort: 30081
+        protocol: TCP
+  - role: worker
+  - role: worker
+  - role: worker

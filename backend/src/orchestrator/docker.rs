@@ -85,13 +85,15 @@ impl Orchestrator for DockerOrchestrator {
         for (container_port, host_port) in &spec.published_ports {
             let key = format!("{container_port}/tcp");
             exposed_ports.insert(key.clone(), HashMap::new());
-            port_bindings.insert(
-                key,
-                Some(vec![PortBinding {
-                    host_ip: Some("0.0.0.0".to_string()),
-                    host_port: Some(host_port.to_string()),
-                }]),
-            );
+            if let Some(host_port) = host_port {
+                port_bindings.insert(
+                    key,
+                    Some(vec![PortBinding {
+                        host_ip: Some("0.0.0.0".to_string()),
+                        host_port: Some(host_port.to_string()),
+                    }]),
+                );
+            }
         }
 
         let mounts = spec.volume.as_ref().map(|(vol, path)| {

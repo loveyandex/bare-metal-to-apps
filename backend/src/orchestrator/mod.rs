@@ -1,4 +1,5 @@
 pub mod docker;
+pub mod kubernetes;
 
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -9,10 +10,11 @@ pub struct RunSpec {
     pub image: String,
     pub network: String,
     pub env: HashMap<String, String>,
-    /// (container_port, host_port) — only used for services that need a
-    /// host-published port (e.g. dev convenience). Internal service-to-service
-    /// traffic uses the docker network DNS name instead.
-    pub published_ports: Vec<(u16, u16)>,
+    /// (container_port, host_port). Internal service-to-service traffic uses
+    /// the network/namespace DNS name instead — a port only needs a
+    /// `host_port` here when it should be reachable from outside (published
+    /// on the docker host, or a Kubernetes NodePort).
+    pub published_ports: Vec<(u16, Option<u16>)>,
     pub volume: Option<(String, String)>, // (volume_name, mount_path)
     pub cmd: Option<Vec<String>>,
 }

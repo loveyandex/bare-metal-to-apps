@@ -10,6 +10,7 @@ mod ws;
 use axum::routing::{delete, get, post};
 use axum::Router;
 use orchestrator::docker::DockerOrchestrator;
+use orchestrator::kubernetes::KubernetesOrchestrator;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -29,13 +30,15 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5433/paas".to_string());
     let pool = db::connect(&database_url).await?;
 
-    let orchestrator: Arc<dyn orchestrator::Orchestrator> = Arc::new(DockerOrchestrator::connect()?);
+    let docker: Arc<dyn orchestrator::Orchestrator> = Arc::new(DockerOrchestrator::connect()?);
+    let kubernetes: Arc<dyn orchestrator::Orchestrator> = Arc::new(KubernetesOrchestrator::new());
     let hub = ws::Hub::new();
     let (deploy_tx, deploy_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let state = AppState {
         pool: pool.clone(),
-        orchestrator: orchestrator.clone(),
+        docker: docker.clone(),
+        kubernetes: kubernetes.clone(),
         hub: hub.clone(),
         deploy_queue: deploy_tx.clone(),
     };
@@ -50,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = deploy_tx.send(id);
     }
 
-    tokio::spawn(worker::run(pool, orchestrator, hub, deploy_rx));
+    tokio::spawn(worker::run(pool, docker, kubernetes, hub, deploy_rx));
 
     let app = Router::new()
         .route("/api/projects", get(routes::projects::list_projects).post(routes::projects::create_project))
@@ -72,7 +75,12 @@ async fn main() -> anyhow::Result<()> {
             "/api/services/:id/env",
             get(routes::services::list_env).put(routes::services::set_env),
         )
+        .route("/api/services/:id/env/raw", post(routes::services::set_env_raw))
         .route("/api/services/:sid/env/:eid", delete(routes::services::delete_env))
+        .route(
+            "/api/services/:id/ports",
+            get(routes::services::list_ports).put(routes::services::set_ports),
+        )
         .route("/ws", get(routes::ws::ws_handler))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())

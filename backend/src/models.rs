@@ -8,7 +8,64 @@ pub struct Project {
     pub name: String,
     pub slug: String,
     pub docker_network: String,
+    pub deploy_mode: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployMode {
+    Docker,
+    Kubernetes,
+}
+
+impl std::fmt::Display for DeployMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeployMode::Docker => write!(f, "docker"),
+            DeployMode::Kubernetes => write!(f, "kubernetes"),
+        }
+    }
+}
+
+impl std::str::FromStr for DeployMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "docker" => Ok(DeployMode::Docker),
+            "kubernetes" => Ok(DeployMode::Kubernetes),
+            other => anyhow::bail!("unknown deploy mode {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PortProtocol {
+    Tcp,
+    Udp,
+}
+
+impl PortProtocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PortProtocol::Tcp => "TCP",
+            PortProtocol::Udp => "UDP",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct PortMapping {
+    pub container_port: u16,
+    /// Host (docker mode) or NodePort (kubernetes mode, must be 30000-32767 if set).
+    pub host_port: Option<u16>,
+    #[serde(default = "default_protocol")]
+    pub protocol: PortProtocol,
+}
+
+fn default_protocol() -> PortProtocol {
+    PortProtocol::Tcp
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, sqlx::Type, PartialEq, Eq)]
@@ -138,6 +195,7 @@ pub struct Service {
     pub container_id: Option<String>,
     pub container_name: String,
     pub desired_replicas: i32,
+    pub ports: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

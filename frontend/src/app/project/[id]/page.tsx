@@ -6,6 +6,7 @@ import "reactflow/dist/style.css";
 import { api, type EnvVarMasked, type ProjectDetail, type Service } from "@/lib/api";
 import { useLiveEvents } from "@/lib/use-ws";
 import { Topbar } from "@/components/paas/topbar";
+import { DeployModeBadge } from "@/components/paas/deploy-mode-badge";
 import { ServiceNode } from "@/components/paas/service-node";
 import { CreateServiceDialog } from "@/components/paas/create-service-dialog";
 import { ServicePanel } from "@/components/paas/service-panel";
@@ -97,6 +98,7 @@ export default function ProjectPage({ params }: PageProps<"/project/[id]">) {
     <>
       <Topbar>
         <span className="text-sm text-muted">{project.name}</span>
+        <DeployModeBadge mode={project.deploy_mode} />
       </Topbar>
       <div className="relative flex-1">
         <div className="absolute right-4 top-4 z-10 flex gap-2">
@@ -138,6 +140,7 @@ export default function ProjectPage({ params }: PageProps<"/project/[id]">) {
       />
       <ServicePanel
         service={activeService}
+        deployMode={project.deploy_mode}
         onOpenChange={(open) => !open && setActiveServiceId(null)}
         onDeleted={() => {
           setActiveServiceId(null);

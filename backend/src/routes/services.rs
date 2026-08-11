@@ -1,6 +1,6 @@
 use super::projects::internal;
 use crate::dbprovision;
-use crate::models::{DbEngine, DeploySource, EnvVar, EnvVarMasked, Service};
+use crate::models::{DbEngine, DeploySource, EnvVar, EnvVarMasked, PortMapping, Service};
 use crate::worker::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -36,12 +36,13 @@ pub async fn create_service(
     Path(project_id): Path<Uuid>,
     Json(body): Json<CreateServiceBody>,
 ) -> Result<Json<Service>, (StatusCode, String)> {
-    let project_slug: String = sqlx::query_scalar("select slug from projects where id = $1")
-        .bind(project_id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "project not found".to_string()))?;
+    let (project_slug, deploy_mode): (String, String) =
+        sqlx::query_as("select slug, deploy_mode from projects where id = $1")
+            .bind(project_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal)?
+            .ok_or((StatusCode::NOT_FOUND, "project not found".to_string()))?;
 
     let (kind, name, deploy_source): (&str, String, DeploySource) = match &body {
         CreateServiceBody::DockerImage { name, image } => (
@@ -82,7 +83,7 @@ pub async fn create_service(
     let service: Service = sqlx::query_as(
         "insert into services (project_id, name, slug, kind, deploy_source, container_name)
          values ($1, $2, $3, $4, $5, $6)
-         returning id, project_id, name, slug, kind, deploy_source, status, status_message, container_id, container_name, desired_replicas, created_at, updated_at",
+         returning id, project_id, name, slug, kind, deploy_source, status, status_message, container_id, container_name, desired_replicas, ports, created_at, updated_at",
     )
     .bind(project_id)
     .bind(&name)
@@ -95,11 +96,15 @@ pub async fn create_service(
     .map_err(internal)?;
 
     if let DeploySource::Database { engine } = &deploy_source {
+        // The DNS-resolvable hostname other services will use to reach this
+        // one differs by deploy target: a Docker container's name on the
+        // shared bridge network, or a Kubernetes Service named after the slug.
+        let internal_host = if deploy_mode == "kubernetes" { slug.clone() } else { container_name.clone() };
         let password = dbprovision::generate_password();
         insert_env(&state, service.id, "DB_PASSWORD", &password, true, true)
             .await
             .map_err(internal)?;
-        for gv in dbprovision::output_vars(*engine, &container_name, &password) {
+        for gv in dbprovision::output_vars(*engine, &internal_host, &password) {
             insert_env(&state, service.id, &gv.key, &gv.value, gv.is_secret, true)
                 .await
                 .map_err(internal)?;
@@ -145,7 +150,7 @@ pub async fn get_service(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Service>, (StatusCode, String)> {
     let service: Service = sqlx::query_as(
-        "select id, project_id, name, slug, kind, deploy_source, status, status_message, container_id, container_name, desired_replicas, created_at, updated_at
+        "select id, project_id, name, slug, kind, deploy_source, status, status_message, container_id, container_name, desired_replicas, ports, created_at, updated_at
          from services where id = $1",
     )
     .bind(id)
@@ -170,7 +175,14 @@ pub async fn delete_service(
         return Err((StatusCode::NOT_FOUND, "service not found".to_string()));
     };
     if let Some(cid) = container_id {
-        let _ = state.orchestrator.stop_and_remove(&cid).await;
+        let deploy_mode: Option<String> =
+            sqlx::query_scalar("select deploy_mode from projects where id = $1")
+                .bind(project_id)
+                .fetch_optional(&state.pool)
+                .await
+                .map_err(internal)?;
+        let orchestrator = state.orchestrator_for(deploy_mode.as_deref().unwrap_or("docker"));
+        let _ = orchestrator.stop_and_remove(&cid).await;
     }
     sqlx::query("delete from services where id = $1")
         .bind(id)
@@ -208,18 +220,18 @@ pub async fn get_logs(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    let container_id: Option<String> =
-        sqlx::query_scalar("select container_id from services where id = $1")
-            .bind(id)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(internal)?
-            .flatten();
-    let Some(cid) = container_id else {
+    let row: Option<(Option<String>, String)> = sqlx::query_as(
+        "select s.container_id, p.deploy_mode from services s join projects p on p.id = s.project_id where s.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(internal)?;
+    let Some((Some(cid), deploy_mode)) = row else {
         return Ok(Json(vec![]));
     };
     let logs = state
-        .orchestrator
+        .orchestrator_for(&deploy_mode)
         .logs(&cid, 200)
         .await
         .map_err(internal)?;
@@ -301,4 +313,99 @@ pub async fn delete_env(
         .await
         .map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct SetEnvRawBody {
+    /// Railway-style "paste a .env block" raw editor: one `KEY=VALUE` (or
+    /// `KEY="VALUE"`) per line; blank lines and `#`-comments are ignored.
+    pub text: String,
+}
+
+pub async fn set_env_raw(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetEnvRawBody>,
+) -> Result<Json<Vec<EnvVarMasked>>, (StatusCode, String)> {
+    for line in body.text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let mut value = value.trim();
+        if value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\'')))
+        {
+            value = &value[1..value.len() - 1];
+        }
+        insert_env(&state, id, key, value, false, false)
+            .await
+            .map_err(internal)?;
+    }
+
+    let vars: Vec<EnvVar> = sqlx::query_as(
+        "select id, service_id, key, value, is_secret, is_generated from env_vars where service_id = $1 order by key",
+    )
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(vars.into_iter().map(Into::into).collect()))
+}
+
+pub async fn list_ports(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<PortMapping>>, (StatusCode, String)> {
+    let ports_json: serde_json::Value = sqlx::query_scalar("select ports from services where id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "service not found".to_string()))?;
+    let ports: Vec<PortMapping> = serde_json::from_value(ports_json).unwrap_or_default();
+    Ok(Json(ports))
+}
+
+#[derive(Deserialize)]
+pub struct SetPortsBody {
+    pub ports: Vec<PortMapping>,
+}
+
+pub async fn set_ports(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetPortsBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    for p in &body.ports {
+        if let Some(host_port) = p.host_port {
+            if host_port == 0 {
+                return Err((StatusCode::BAD_REQUEST, "host_port must be > 0".to_string()));
+            }
+        }
+    }
+    let ports_json = serde_json::to_value(&body.ports).map_err(internal)?;
+    let exists: Option<Uuid> = sqlx::query_scalar(
+        "update services set ports = $1, updated_at = now() where id = $2 returning id",
+    )
+    .bind(&ports_json)
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(internal)?;
+    if exists.is_none() {
+        return Err((StatusCode::NOT_FOUND, "service not found".to_string()));
+    }
+
+    // Ports only take effect on the running container/pod after a redeploy.
+    state.deploy_queue.send(id).ok();
+    Ok(StatusCode::ACCEPTED)
 }

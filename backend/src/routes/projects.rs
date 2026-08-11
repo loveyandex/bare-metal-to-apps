@@ -11,6 +11,12 @@ use uuid::Uuid;
 #[derive(Deserialize)]
 pub struct CreateProject {
     pub name: String,
+    #[serde(default = "default_deploy_mode")]
+    pub deploy_mode: String,
+}
+
+fn default_deploy_mode() -> String {
+    "docker".to_string()
 }
 
 fn slugify(name: &str) -> String {
@@ -59,22 +65,40 @@ pub async fn create_project(
         slug = format!("{base_slug}-{n}");
     }
 
+    let deploy_mode = match body.deploy_mode.as_str() {
+        "docker" | "kubernetes" => body.deploy_mode.clone(),
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown deploy_mode {other}, expected \"docker\" or \"kubernetes\""),
+            ))
+        }
+    };
     let docker_network = format!("paas-net-{slug}");
 
     let project: Project = sqlx::query_as(
-        "insert into projects (name, slug, docker_network) values ($1, $2, $3)
-         returning id, name, slug, docker_network, created_at",
+        "insert into projects (name, slug, docker_network, deploy_mode) values ($1, $2, $3, $4)
+         returning id, name, slug, docker_network, deploy_mode, created_at",
     )
     .bind(&body.name)
     .bind(&slug)
     .bind(&docker_network)
+    .bind(&deploy_mode)
     .fetch_one(&state.pool)
     .await
     .map_err(internal)?;
 
+    // Docker mode provisions its bridge network up front; Kubernetes mode
+    // provisions its namespace up front using the project slug (not the
+    // docker_network name, which is unused in that mode).
+    let network_or_namespace = if deploy_mode == "kubernetes" {
+        slug.clone()
+    } else {
+        docker_network.clone()
+    };
     state
-        .orchestrator
-        .ensure_network(&docker_network)
+        .orchestrator_for(&deploy_mode)
+        .ensure_network(&network_or_namespace)
         .await
         .map_err(internal)?;
 
@@ -85,7 +109,7 @@ pub async fn list_projects(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Project>>, (StatusCode, String)> {
     let projects: Vec<Project> = sqlx::query_as(
-        "select id, name, slug, docker_network, created_at from projects order by created_at desc",
+        "select id, name, slug, docker_network, deploy_mode, created_at from projects order by created_at desc",
     )
     .fetch_all(&state.pool)
     .await
@@ -105,7 +129,7 @@ pub async fn get_project(
     Path(id): Path<Uuid>,
 ) -> Result<Json<ProjectDetail>, (StatusCode, String)> {
     let project: Project = sqlx::query_as(
-        "select id, name, slug, docker_network, created_at from projects where id = $1",
+        "select id, name, slug, docker_network, deploy_mode, created_at from projects where id = $1",
     )
     .bind(id)
     .fetch_optional(&state.pool)
@@ -114,7 +138,7 @@ pub async fn get_project(
     .ok_or((StatusCode::NOT_FOUND, "project not found".to_string()))?;
 
     let services: Vec<crate::models::Service> = sqlx::query_as(
-        "select id, project_id, name, slug, kind, deploy_source, status, status_message, container_id, container_name, desired_replicas, created_at, updated_at
+        "select id, project_id, name, slug, kind, deploy_source, status, status_message, container_id, container_name, desired_replicas, ports, created_at, updated_at
          from services where project_id = $1 order by created_at asc",
     )
     .bind(id)
@@ -129,6 +153,18 @@ pub async fn delete_project(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    let project: Option<(String, String, String)> =
+        sqlx::query_as("select slug, docker_network, deploy_mode from projects where id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal)?;
+    let Some((slug, docker_network, deploy_mode)) = project else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+
+    let orchestrator = state.orchestrator_for(&deploy_mode);
+
     let services: Vec<(Uuid, Option<String>)> =
         sqlx::query_as("select id, container_id from services where project_id = $1")
             .bind(id)
@@ -137,17 +173,13 @@ pub async fn delete_project(
             .map_err(internal)?;
     for (_svc_id, container_id) in services {
         if let Some(cid) = container_id {
-            let _ = state.orchestrator.stop_and_remove(&cid).await;
+            let _ = orchestrator.stop_and_remove(&cid).await;
         }
     }
-    let network: Option<String> = sqlx::query_scalar("select docker_network from projects where id = $1")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(internal)?;
-    if let Some(net) = network {
-        let _ = state.orchestrator.remove_network(&net).await;
-    }
+
+    let network_or_namespace = if deploy_mode == "kubernetes" { slug } else { docker_network };
+    let _ = orchestrator.remove_network(&network_or_namespace).await;
+
     sqlx::query("delete from projects where id = $1")
         .bind(id)
         .execute(&state.pool)
