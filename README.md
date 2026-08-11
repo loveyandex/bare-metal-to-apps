@@ -28,11 +28,28 @@ cd backend
 cp .env.example .env
 cargo run   # listens on :8080
 
-# 3. frontend
+# 3. frontend — build first so any build-time error surfaces before you're
+#    staring at a dev server that "works" until you deploy it
 cd frontend
 cp .env.local.example .env.local
 npm install
-npm run dev # listens on :3000
+npm run build
+npm start   # listens on :3000
+```
+
+Use `npm run dev` day-to-day while iterating, but always run `npm run build`
+before calling something done — some errors (env/config issues, native
+binding resolution, etc.) only show up at build time, not in dev mode.
+
+If `npm install` leaves a broken `@tailwindcss/oxide` / `lightningcss` native
+binding (`Cannot find native binding` / `Cannot find module
+'@tailwindcss/oxide-linux-x64-gnu'` at build time — a known npm optional-deps
+bug, npm/cli#4828), do a clean reinstall:
+
+```bash
+rm -rf node_modules package-lock.json .next
+npm install
+npm run build
 ```
 
 Open http://localhost:3000, create a project, then add a service either from
