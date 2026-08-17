@@ -1,6 +1,7 @@
 "use client";
 
 import { use, useCallback, useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import ReactFlow, { Background, Controls, type Edge, type Node } from "reactflow";
 import "reactflow/dist/style.css";
 import { api, type EnvVarMasked, type ProjectDetail, type Service } from "@/lib/api";
@@ -11,16 +12,19 @@ import { ServiceNode } from "@/components/paas/service-node";
 import { CreateServiceDialog } from "@/components/paas/create-service-dialog";
 import { ServicePanel } from "@/components/paas/service-panel";
 import { Button } from "@/components/ui/button";
-import { Plus } from "lucide-react";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { ChevronDown, Plus, RefreshCw, RotateCcw, RotateCw, Trash2 } from "lucide-react";
 
 const nodeTypes = { service: ServiceNode };
 
 export default function ProjectPage({ params }: PageProps<"/project/[id]">) {
   const { id } = use(params);
+  const router = useRouter();
   const [project, setProject] = useState<ProjectDetail | null>(null);
   const [envByService, setEnvByService] = useState<Record<string, EnvVarMasked[]>>({});
   const [createOpen, setCreateOpen] = useState(false);
   const [activeServiceId, setActiveServiceId] = useState<string | null>(null);
+  const [projectBusy, setProjectBusy] = useState(false);
 
   const refresh = useCallback(() => {
     api
@@ -85,6 +89,55 @@ export default function ProjectPage({ params }: PageProps<"/project/[id]">) {
     [project, envByService],
   );
 
+  async function restartProject() {
+    setProjectBusy(true);
+    try {
+      await api.restartProject(id);
+    } finally {
+      setProjectBusy(false);
+    }
+  }
+
+  async function redeployProject() {
+    setProjectBusy(true);
+    try {
+      await api.redeployProject(id);
+    } finally {
+      setProjectBusy(false);
+    }
+  }
+
+  async function resetProject() {
+    if (
+      !confirm(
+        "Reset this project's environment? This tears down every service's container/pod and the whole network/namespace, then redeploys everything from scratch. The project and its services stay.",
+      )
+    )
+      return;
+    setProjectBusy(true);
+    try {
+      await api.resetProject(id);
+    } finally {
+      setProjectBusy(false);
+    }
+  }
+
+  async function deleteProject() {
+    if (
+      !confirm(
+        `Delete project "${project?.name}" entirely? This removes all its services and their containers/pods permanently — this can't be undone.`,
+      )
+    )
+      return;
+    setProjectBusy(true);
+    try {
+      await api.deleteProject(id);
+      router.push("/");
+    } catch {
+      setProjectBusy(false);
+    }
+  }
+
   if (!project) {
     return (
       <>
@@ -105,6 +158,29 @@ export default function ProjectPage({ params }: PageProps<"/project/[id]">) {
           <Button size="sm" variant="secondary" onClick={refresh}>
             Sync
           </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <Button size="sm" variant="secondary" disabled={projectBusy}>
+                  Project <ChevronDown className="h-3.5 w-3.5" />
+                </Button>
+              }
+            />
+            <DropdownMenuContent>
+              <DropdownMenuItem onClick={restartProject}>
+                <RotateCw className="h-3.5 w-3.5" /> Restart all services
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={redeployProject}>
+                <RefreshCw className="h-3.5 w-3.5" /> Redeploy all services
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={resetProject}>
+                <RotateCcw className="h-3.5 w-3.5" /> Reset environment
+              </DropdownMenuItem>
+              <DropdownMenuItem destructive onClick={deleteProject}>
+                <Trash2 className="h-3.5 w-3.5" /> Delete project
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
           <Button size="sm" onClick={() => setCreateOpen(true)}>
             <Plus className="h-4 w-4" /> Create
           </Button>

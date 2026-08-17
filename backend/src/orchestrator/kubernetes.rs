@@ -251,27 +251,78 @@ impl Orchestrator for KubernetesOrchestrator {
 
     async fn inspect(&self, container_id: &str) -> anyhow::Result<ContainerState> {
         let (namespace, name) = split_id(container_id)?;
-        let out = kubectl(&[
-            "get",
-            "pods",
+        let Some(pod) = first_pod(namespace, name).await? else {
+            return Ok(ContainerState::NotFound);
+        };
+        Ok(pod_container_state(&pod))
+    }
+
+    async fn restart(&self, container_id: &str) -> anyhow::Result<()> {
+        let (namespace, name) = split_id(container_id)?;
+        kubectl(&[
+            "rollout",
+            "restart",
+            &format!("deployment/{name}"),
             "-n",
             namespace,
-            "-l",
-            &format!("app={name}"),
-            "-o",
-            "jsonpath={.items[0].status.phase}",
         ])
-        .await;
-        let phase = match out {
-            Ok(p) => p,
-            Err(_) => return Ok(ContainerState::NotFound),
-        };
-        Ok(match phase.trim() {
-            "Running" => ContainerState::Running,
-            "Failed" => ContainerState::Exited { code: 1 },
-            "" => ContainerState::NotFound,
-            other => ContainerState::Other(other.to_string()),
-        })
+        .await?;
+        Ok(())
+    }
+
+    async fn describe(&self, container_id: &str) -> anyhow::Result<serde_json::Value> {
+        let (namespace, name) = split_id(container_id)?;
+
+        let deployment = kubectl(&["get", "deployment", name, "-n", namespace, "-o", "json"])
+            .await
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        let deployment_summary = deployment.as_ref().map(|d| {
+            let status = d.get("status").cloned().unwrap_or_default();
+            let replicas = status.get("replicas").and_then(|v| v.as_i64()).unwrap_or(0);
+            let ready = status.get("readyReplicas").and_then(|v| v.as_i64()).unwrap_or(0);
+            let available = status.get("availableReplicas").and_then(|v| v.as_i64()).unwrap_or(0);
+            let updated = status.get("updatedReplicas").and_then(|v| v.as_i64()).unwrap_or(0);
+            let condition = status
+                .get("conditions")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.iter().find(|c| c.get("type").and_then(|t| t.as_str()) == Some("Available")))
+                .and_then(|c| c.get("status"))
+                .and_then(|s| s.as_str());
+            let status_label = if available >= replicas.max(1) && replicas > 0 {
+                "Available"
+            } else if condition == Some("False") && replicas == 0 {
+                "Scaled to zero"
+            } else {
+                "Progressing"
+            };
+            serde_json::json!({
+                "name": name,
+                "status": status_label,
+                "replicas": replicas,
+                "ready": ready,
+                "available": available,
+                "updated": updated,
+            })
+        });
+
+        let pods_json = kubectl(&["get", "pods", "-n", namespace, "-l", &format!("app={name}"), "-o", "json"])
+            .await
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        let pods: Vec<serde_json::Value> = pods_json
+            .as_ref()
+            .and_then(|v| v.get("items"))
+            .and_then(|v| v.as_array())
+            .map(|items| items.iter().map(pod_summary).collect())
+            .unwrap_or_default();
+
+        Ok(serde_json::json!({
+            "kind": "kubernetes",
+            "namespace": namespace,
+            "deployment": deployment_summary,
+            "pods": pods,
+        }))
     }
 
     async fn stop_and_remove(&self, container_id: &str) -> anyhow::Result<()> {
@@ -318,6 +369,80 @@ impl Orchestrator for KubernetesOrchestrator {
     }
 }
 
+/// Fetches the first pod matching `app=<name>` in `namespace`, parsed as raw
+/// JSON, or `None` if there isn't one yet (still scheduling, or gone).
+async fn first_pod(namespace: &str, name: &str) -> anyhow::Result<Option<serde_json::Value>> {
+    let out = kubectl(&["get", "pods", "-n", namespace, "-l", &format!("app={name}"), "-o", "json"]).await;
+    let json_str = match out {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
+    Ok(parsed
+        .get("items")
+        .and_then(|v| v.as_array())
+        .and_then(|items| items.first())
+        .cloned())
+}
+
+/// Maps a single Pod's JSON into our `ContainerState`, distinguishing normal
+/// startup (`Pending`) from genuinely actionable problems (image pull
+/// failure, crash-loop, terminal exit) — this is the mapping that used to
+/// collapse everything non-`Running` into "failed" after ~30s, which is what
+/// made a slow-but-healthy image pull look like a broken deploy.
+fn pod_container_state(pod: &serde_json::Value) -> ContainerState {
+    let phase = pod.pointer("/status/phase").and_then(|v| v.as_str()).unwrap_or("");
+    let cs = pod.pointer("/status/containerStatuses/0");
+    let restart_count = cs.and_then(|c| c.get("restartCount")).and_then(|v| v.as_i64()).unwrap_or(0);
+    let ready = cs.and_then(|c| c.get("ready")).and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if let Some(waiting) = cs.and_then(|c| c.pointer("/state/waiting")) {
+        let reason = waiting.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        return match reason {
+            "ImagePullBackOff" | "ErrImagePull" | "InvalidImageName" | "ImageInspectError" => {
+                let message = waiting.get("message").and_then(|v| v.as_str()).unwrap_or(reason);
+                ContainerState::ImagePullError { reason: message.to_string() }
+            }
+            "CrashLoopBackOff" => ContainerState::CrashLoopBackOff { restarts: restart_count },
+            "" => ContainerState::Pending { reason: None },
+            other => ContainerState::Pending { reason: Some(other.to_string()) },
+        };
+    }
+
+    if let Some(terminated) = cs.and_then(|c| c.pointer("/state/terminated")) {
+        let code = terminated.get("exitCode").and_then(|v| v.as_i64()).unwrap_or(-1);
+        return ContainerState::Exited { code };
+    }
+
+    match phase {
+        "Running" if ready => ContainerState::Running,
+        "Running" => ContainerState::Pending { reason: Some("starting".to_string()) },
+        "Pending" => ContainerState::Pending { reason: Some("scheduling".to_string()) },
+        "Succeeded" => ContainerState::Exited { code: 0 },
+        "Failed" => ContainerState::Exited { code: 1 },
+        "" => ContainerState::NotFound,
+        other => ContainerState::Other(other.to_string()),
+    }
+}
+
+fn pod_summary(pod: &serde_json::Value) -> serde_json::Value {
+    let name = pod.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or("");
+    let phase = pod.pointer("/status/phase").and_then(|v| v.as_str()).unwrap_or("Unknown");
+    let cs = pod.pointer("/status/containerStatuses/0");
+    let ready = cs.and_then(|c| c.get("ready")).and_then(|v| v.as_bool()).unwrap_or(false);
+    let restarts = cs.and_then(|c| c.get("restartCount")).and_then(|v| v.as_i64()).unwrap_or(0);
+    let reason = cs
+        .and_then(|c| c.pointer("/state/waiting/reason").or_else(|| c.pointer("/state/terminated/reason")))
+        .and_then(|v| v.as_str());
+    serde_json::json!({
+        "name": name,
+        "status": reason.unwrap_or(phase),
+        "phase": phase,
+        "ready": ready,
+        "restarts": restarts,
+    })
+}
+
 fn split_id(container_id: &str) -> anyhow::Result<(&str, &str)> {
     container_id
         .split_once('/')
@@ -346,5 +471,62 @@ mod tests {
         println!("{manifest}");
         assert!(manifest.contains("metadata:\n  name: with-kubernetes-ghcr-io-love-solana-sqlx-v1-0-13\n"));
         assert!(!manifest.contains("\nname:")); // would indicate an un-indented, top-level `name:`
+    }
+
+    fn pod_json(v: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "status": v })
+    }
+
+    #[test]
+    fn pending_pod_pulling_image_is_pending_not_failed() {
+        // This is the exact shape kubectl returns while a slow ghcr.io pull is
+        // in progress: phase Pending, container waiting on ContainerCreating.
+        let pod = pod_json(serde_json::json!({
+            "phase": "Pending",
+            "containerStatuses": [{"ready": false, "restartCount": 0, "state": {"waiting": {"reason": "ContainerCreating"}}}],
+        }));
+        assert_eq!(
+            pod_container_state(&pod),
+            ContainerState::Pending { reason: Some("ContainerCreating".to_string()) }
+        );
+    }
+
+    #[test]
+    fn scheduling_with_no_container_statuses_yet_is_pending() {
+        let pod = pod_json(serde_json::json!({ "phase": "Pending" }));
+        assert_eq!(
+            pod_container_state(&pod),
+            ContainerState::Pending { reason: Some("scheduling".to_string()) }
+        );
+    }
+
+    #[test]
+    fn image_pull_backoff_is_a_real_error() {
+        let pod = pod_json(serde_json::json!({
+            "phase": "Pending",
+            "containerStatuses": [{"ready": false, "restartCount": 0, "state": {"waiting": {"reason": "ImagePullBackOff", "message": "rate limited"}}}],
+        }));
+        assert_eq!(
+            pod_container_state(&pod),
+            ContainerState::ImagePullError { reason: "rate limited".to_string() }
+        );
+    }
+
+    #[test]
+    fn crash_loop_is_distinct_from_a_one_shot_exit() {
+        let pod = pod_json(serde_json::json!({
+            "phase": "Running",
+            "containerStatuses": [{"ready": false, "restartCount": 4, "state": {"waiting": {"reason": "CrashLoopBackOff"}}}],
+        }));
+        assert_eq!(pod_container_state(&pod), ContainerState::CrashLoopBackOff { restarts: 4 });
+    }
+
+    #[test]
+    fn ready_running_pod_is_running() {
+        let pod = pod_json(serde_json::json!({
+            "phase": "Running",
+            "containerStatuses": [{"ready": true, "restartCount": 0, "state": {"running": {"startedAt": "now"}}}],
+        }));
+        assert_eq!(pod_container_state(&pod), ContainerState::Running);
     }
 }

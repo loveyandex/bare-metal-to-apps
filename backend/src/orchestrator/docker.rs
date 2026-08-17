@@ -2,7 +2,7 @@ use super::{ContainerState, Orchestrator, RunSpec};
 use async_trait::async_trait;
 use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, LogOutput, LogsOptions,
-    RemoveContainerOptions, StopContainerOptions,
+    RemoveContainerOptions, RestartContainerOptions, StopContainerOptions,
 };
 use bollard::network::CreateNetworkOptions;
 use bollard::secret::{HostConfig, Mount, MountTypeEnum, PortBinding};
@@ -169,6 +169,9 @@ impl Orchestrator for DockerOrchestrator {
 
         match c.state.as_deref() {
             Some("running") => Ok(ContainerState::Running),
+            Some("created") => Ok(ContainerState::Pending {
+                reason: Some("created".to_string()),
+            }),
             Some("exited") => {
                 let code = self
                     .client
@@ -180,9 +183,40 @@ impl Orchestrator for DockerOrchestrator {
                     .unwrap_or(-1);
                 Ok(ContainerState::Exited { code })
             }
+            Some("restarting") => {
+                let restarts = self
+                    .client
+                    .inspect_container(container_id, None)
+                    .await
+                    .ok()
+                    .and_then(|d| d.restart_count)
+                    .unwrap_or(0);
+                Ok(ContainerState::CrashLoopBackOff { restarts })
+            }
             Some(other) => Ok(ContainerState::Other(other.to_string())),
             None => Ok(ContainerState::NotFound),
         }
+    }
+
+    async fn restart(&self, container_id: &str) -> anyhow::Result<()> {
+        self.client
+            .restart_container(container_id, Some(RestartContainerOptions { t: 10 }))
+            .await?;
+        Ok(())
+    }
+
+    async fn describe(&self, container_id: &str) -> anyhow::Result<serde_json::Value> {
+        let d = self.client.inspect_container(container_id, None).await?;
+        Ok(serde_json::json!({
+            "kind": "docker",
+            "id": d.id,
+            "image": d.config.and_then(|c| c.image),
+            "state": d.state.as_ref().and_then(|s| s.status).map(|s| format!("{s:?}")),
+            "started_at": d.state.as_ref().and_then(|s| s.started_at.clone()),
+            "restart_count": d.restart_count,
+            "exit_code": d.state.as_ref().and_then(|s| s.exit_code),
+            "error": d.state.as_ref().and_then(|s| s.error.clone()).filter(|e| !e.is_empty()),
+        }))
     }
 
     async fn stop_and_remove(&self, container_id: &str) -> anyhow::Result<()> {

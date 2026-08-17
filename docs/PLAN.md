@@ -46,12 +46,21 @@ so the rest of the backend doesn't care which one a project uses.
 - `Project { id, name, slug, docker_network, deploy_mode(docker|kubernetes),
   created_at }` — `deploy_mode` is fixed at creation time.
 - `Service { id, project_id, name, kind(app|database), deploy_source(json),
-  status(creating|running|crashed|failed|stopped|deleting),
+  status(creating|pending|running|crashed|failed|stopped|deleting),
   container_id, container_name, ports(json), created_at, updated_at }`
   - `deploy_source` is a tagged enum: `DockerImage { image }` or
     `Database { engine: postgres|redis|mysql|mongodb }`.
   - `ports` is a list of `{ container_port, host_port?, protocol }`; editable
     from the UI's Networking tab, applying triggers a redeploy.
+  - `status` distinguishes `pending` (still legitimately scheduling/pulling
+    the image/starting — normal, not an error) from `crashed`
+    (CrashLoopBackOff or a runtime crash — deployed, but unhealthy) and
+    `failed` (genuinely couldn't get running after retries). See
+    "Status model" below — this used to collapse into "failed" after
+    ~30 seconds regardless of cause.
+- `DeployEvent { id, service_id, status, message, created_at }` — every
+  status transition the reconciliation worker records, read via
+  `GET /api/services/:id/events` as a timeline (the "event matrix").
 - `EnvVar { id, service_id, key, value, is_secret, is_generated }`
   - `value` may reference another service's output var with
     `${{service-slug.KEY}}`; resolved at deploy time.
@@ -70,6 +79,8 @@ so the rest of the backend doesn't care which one a project uses.
       inspect status, stop/remove.
 - [x] Reconciliation worker: drives services from `creating` to `running`,
       retries on failure, marks `crashed` when the container exits.
+      Polls up to 5 minutes for a slow image pull (`pending`, live reason
+      shown) before treating it as a failed attempt — see "Status model".
 - [x] WebSocket broadcast of service status + log lines to connected UIs.
 - [x] Deploy-from-Docker-image flow (no Git/registry auth needed).
 - [x] One-click database provisioning (Postgres, Redis) with generated
@@ -81,8 +92,14 @@ so the rest of the backend doesn't care which one a project uses.
 
 ### Phase 1 — Deploy loop polish
 - [x] Published ports per service (Docker host port / Kubernetes NodePort),
-      editable from the UI, applying triggers a redeploy.
+      editable from the UI, applying triggers a redeploy. On Kubernetes, a
+      port with a host port also gets a managed `kubectl port-forward` so
+      it's reachable at `localhost` even on a plain local `kind` cluster.
 - [x] Raw `.env`-paste bulk env var editor (Railway-style raw mode).
+- [x] Richer status model (`pending` vs `crashed` vs `failed`), event
+      timeline, `describe()` Deployment/Pod detail, and `restart` (in-place)
+      vs `redeploy` (re-apply spec) at both service and project level — see
+      "Status model" below.
 - [ ] GHCR/Docker Hub tag-digest poller: cron task that notices
       `ghcr.io/...:v1.0.13` got a new digest and redeploys automatically
       (the "new image ready → auto redeploy" flow from the brief).
@@ -127,10 +144,10 @@ so the rest of the backend doesn't care which one a project uses.
 - `docker.rs` — bollard talking to the local Docker Unix socket. `network`
   is a bridge network name; `container_name` is the actual container name.
 - `kubernetes.rs` — shells out to `kubectl` (`apply -f -` with a generated
-  Deployment+Service[+PVC] manifest, `get pods -o jsonpath` for status,
-  `delete`/`logs`). `network` is interpreted as the target Namespace;
-  `container_name` becomes the Deployment/Service name (set to the
-  service's slug so DNS names are short and match what `${{slug.KEY}}`
+  Deployment+Service[+PVC] manifest, `get pods -o json` for status,
+  `delete`/`logs`/`rollout restart`). `network` is interpreted as the target
+  Namespace; `container_name` becomes the Deployment/Service name (set to
+  the service's slug so DNS names are short and match what `${{slug.KEY}}`
   linking expects). Requires `kubectl` on PATH with a working
   `~/.kube/config` context — no additional Kubernetes client dependency.
 
@@ -138,3 +155,57 @@ so the rest of the backend doesn't care which one a project uses.
 right one per request based on the owning project's `deploy_mode`, so a
 single running backend serves Docker-mode and Kubernetes-mode projects
 side by side.
+
+## Status model
+
+`ContainerState` (`backend/src/orchestrator/mod.rs`) is the orchestrator's
+point-in-time read of a container/pod, and it's deliberately richer than
+"up or down":
+
+- `Pending { reason }` — still legitimately getting there: scheduling,
+  pulling the image, container starting (Kubernetes' `ContainerCreating`,
+  `PodInitializing`). **Not an error.** Maps to service status `pending`.
+- `Running` — serving. Maps to `running`.
+- `CrashLoopBackOff { restarts }` — deployed, but the process keeps dying
+  and restarting. Retrying the *deploy* won't fix this (the image/app
+  itself is broken at runtime), so the worker reports it and stops, rather
+  than burning retries. Maps to `crashed`.
+- `Exited { code }` — a one-shot crash right after starting. Maps to
+  `crashed` (worker poll loop) or triggers a deploy retry (initial wait).
+- `ImagePullError { reason }` — bad tag, auth, registry down, rate-limited.
+  Surfaced as a `pending` reason (`pulling image: <reason>`) rather than an
+  immediate failure, since some of these (rate limits) are transient.
+- `NotFound` — the container/pod disappeared.
+
+The reconciliation worker's `wait_until_ready` (`backend/src/worker.rs`)
+polls a freshly-started container/pod every 3s for up to 5 minutes,
+live-updating the service's `status`/`status_message` on every *change* of
+state (so the UI shows "waiting: ContainerCreating" while a slow ghcr.io
+pull is in progress) — only exhausting that 5-minute budget while still
+stuck counts as a failed attempt for the outer 5x-with-backoff retry loop.
+This replaced a one-shot check ~2 seconds after start, which is what made a
+merely-slow image pull look identical to a broken deploy.
+
+Every status transition is also recorded to `deploy_events` and readable via
+`GET /api/services/:id/events` — the "event matrix" the UI's Events tab
+renders as a timeline. `GET /api/services/:id/describe` additionally exposes
+orchestrator-native detail: on Kubernetes, the Deployment's rollout status
+(`replicas`/`ready`/`available`) plus each Pod's name/phase/restart count,
+i.e. the same two tables `kubectl get deployment,pods` shows; on Docker, the
+container inspect summary (image, state, restart count, exit code, error).
+
+**Restart vs. redeploy** are two distinct actions, at both service and
+project level:
+- *Restart* (`POST .../restart`) — in-place: `docker restart` / `kubectl
+  rollout restart deployment/...`. Doesn't touch the image, env vars, or
+  ports; just cycles the existing process.
+- *Redeploy* (`POST .../redeploy`) — re-applies the full spec (current
+  image tag, env vars, ports) via the normal deploy queue.
+- *Reset* (project-level only, `POST /api/projects/:id/reset`) — tears down
+  every service's container/pod and the whole network/namespace, recreates
+  the namespace/network, then redeploys everything from scratch. For when
+  the local environment itself has drifted or broken in a way redeploy
+  won't fix. The project and its services stay; only the running
+  infrastructure is recreated.
+- *Delete* (project-level, `DELETE /api/projects/:id`) — full teardown,
+  removes the project and its services from the database too.

@@ -9,7 +9,14 @@ export type DeploySource =
   | { type: "docker_image"; image: string }
   | { type: "database"; engine: DbEngine };
 
-export type ServiceStatus = "creating" | "running" | "crashed" | "failed" | "stopped" | "deleting";
+export type ServiceStatus =
+  | "creating"
+  | "pending"
+  | "running"
+  | "crashed"
+  | "failed"
+  | "stopped"
+  | "deleting";
 
 export interface Project {
   id: string;
@@ -58,6 +65,51 @@ export interface EnvVarMasked {
   is_generated: boolean;
 }
 
+export interface DeployEvent {
+  id: string;
+  service_id: string;
+  status: ServiceStatus | string;
+  message: string | null;
+  created_at: string;
+}
+
+export interface K8sPodSummary {
+  name: string;
+  status: string;
+  phase: string;
+  ready: boolean;
+  restarts: number;
+}
+
+export interface K8sDeploymentSummary {
+  name: string;
+  status: string;
+  replicas: number;
+  ready: number;
+  available: number;
+  updated: number;
+}
+
+export interface KubernetesDescribe {
+  kind: "kubernetes";
+  namespace: string;
+  deployment: K8sDeploymentSummary | null;
+  pods: K8sPodSummary[];
+}
+
+export interface DockerDescribe {
+  kind: "docker";
+  id: string;
+  image: string | null;
+  state: string | null;
+  started_at: string | null;
+  restart_count: number | null;
+  exit_code: number | null;
+  error: string | null;
+}
+
+export type ServiceDescribe = KubernetesDescribe | DockerDescribe | null;
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
@@ -81,6 +133,9 @@ export const api = {
     }),
   getProject: (id: string) => req<ProjectDetail>(`/api/projects/${id}`),
   deleteProject: (id: string) => req<void>(`/api/projects/${id}`, { method: "DELETE" }),
+  restartProject: (id: string) => req<void>(`/api/projects/${id}/restart`, { method: "POST" }),
+  redeployProject: (id: string) => req<void>(`/api/projects/${id}/redeploy`, { method: "POST" }),
+  resetProject: (id: string) => req<void>(`/api/projects/${id}/reset`, { method: "POST" }),
 
   createDockerImageService: (projectId: string, image: string, name?: string) =>
     req<Service>(`/api/projects/${projectId}/services`, {
@@ -95,6 +150,9 @@ export const api = {
   getService: (id: string) => req<Service>(`/api/services/${id}`),
   deleteService: (id: string) => req<void>(`/api/services/${id}`, { method: "DELETE" }),
   redeployService: (id: string) => req<void>(`/api/services/${id}/redeploy`, { method: "POST" }),
+  restartService: (id: string) => req<void>(`/api/services/${id}/restart`, { method: "POST" }),
+  describeService: (id: string) => req<ServiceDescribe>(`/api/services/${id}/describe`),
+  listEvents: (id: string) => req<DeployEvent[]>(`/api/services/${id}/events`),
   getLogs: (id: string) => req<string[]>(`/api/services/${id}/logs`),
 
   listEnv: (id: string, reveal = false) =>

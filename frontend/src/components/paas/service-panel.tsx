@@ -7,8 +7,16 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { StatusBadge } from "@/components/paas/status-badge";
-import { api, type DeployMode, type EnvVarMasked, type PortMapping, type Service } from "@/lib/api";
-import { Eye, EyeOff, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import {
+  api,
+  type DeployEvent,
+  type DeployMode,
+  type EnvVarMasked,
+  type PortMapping,
+  type Service,
+  type ServiceDescribe,
+} from "@/lib/api";
+import { Eye, EyeOff, Plus, RefreshCw, RotateCw, Trash2, X } from "lucide-react";
 
 export function ServicePanel({
   service,
@@ -47,6 +55,8 @@ function ServicePanelContent({
   const [rawMode, setRawMode] = useState(false);
   const [rawText, setRawText] = useState("");
   const [ports, setPortsState] = useState<PortMapping[]>(service.ports);
+  const [describe, setDescribe] = useState<ServiceDescribe>(null);
+  const [events, setEvents] = useState<DeployEvent[]>([]);
   const [busy, setBusy] = useState(false);
 
   const loadEnv = useCallback(() => {
@@ -64,6 +74,15 @@ function ServicePanelContent({
   function loadLogs() {
     api.getLogs(service.id).then(setLogs).catch(() => {});
   }
+
+  const loadStatus = useCallback(() => {
+    api.describeService(service.id).then(setDescribe).catch(() => {});
+    api.listEvents(service.id).then(setEvents).catch(() => {});
+  }, [service.id]);
+
+  useEffect(() => {
+    loadStatus();
+  }, [loadStatus, service.status]);
 
   async function toggleReveal(v: EnvVarMasked) {
     const next = new Set(revealed);
@@ -141,6 +160,15 @@ function ServicePanelContent({
     }
   }
 
+  async function restart() {
+    setBusy(true);
+    try {
+      await api.restartService(service.id);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function remove() {
     if (!confirm(`Delete service "${service.name}"? This removes its container permanently.`)) return;
     setBusy(true);
@@ -165,8 +193,11 @@ function ServicePanelContent({
         )}
       </SheetHeader>
 
-      <div className="mb-4 flex gap-2">
-        <Button size="sm" variant="secondary" onClick={redeploy} disabled={busy}>
+      <div className="mb-4 flex flex-wrap gap-2">
+        <Button size="sm" variant="secondary" onClick={restart} disabled={busy} title="Restart the running container/pod in place, without re-applying its spec">
+          <RotateCw className="h-3.5 w-3.5" /> Restart
+        </Button>
+        <Button size="sm" variant="secondary" onClick={redeploy} disabled={busy} title="Re-apply the full spec: image, env vars, ports">
           <RefreshCw className="h-3.5 w-3.5" /> Redeploy
         </Button>
         <Button size="sm" variant="destructive" onClick={remove} disabled={busy}>
@@ -174,14 +205,24 @@ function ServicePanelContent({
         </Button>
       </div>
 
-      <Tabs defaultValue="variables">
-        <TabsList>
+      <Tabs defaultValue="status">
+        <TabsList className="flex-wrap">
+          <TabsTab value="status" onClick={loadStatus}>
+            Status
+          </TabsTab>
           <TabsTab value="variables">Variables</TabsTab>
           <TabsTab value="networking">Networking</TabsTab>
           <TabsTab value="logs" onClick={loadLogs}>
             Logs
           </TabsTab>
+          <TabsTab value="events" onClick={loadStatus}>
+            Events
+          </TabsTab>
         </TabsList>
+
+        <TabsPanel value="status">
+          <StatusTabContent describe={describe} status={service.status} statusMessage={service.status_message} onRefresh={loadStatus} />
+        </TabsPanel>
 
         <TabsPanel value="variables">
           <div className="mb-2 flex items-center justify-between">
@@ -345,7 +386,128 @@ function ServicePanelContent({
             <RefreshCw className="h-3.5 w-3.5" /> Refresh
           </Button>
         </TabsPanel>
+
+        <TabsPanel value="events">
+          <div className="flex flex-col gap-2">
+            {events.length === 0 && <p className="text-xs text-muted">No events yet.</p>}
+            {events.map((e) => (
+              <div key={e.id} className="rounded-md border border-border bg-canvas px-3 py-2">
+                <div className="flex items-center gap-2">
+                  <StatusBadge status={e.status as Service["status"]} />
+                  <span className="text-[10px] text-muted">{new Date(e.created_at).toLocaleTimeString()}</span>
+                </div>
+                {e.message && <p className="mt-1 text-xs text-muted">{e.message}</p>}
+              </div>
+            ))}
+          </div>
+          <Button size="sm" variant="secondary" className="mt-2" onClick={loadStatus}>
+            <RefreshCw className="h-3.5 w-3.5" /> Refresh
+          </Button>
+        </TabsPanel>
       </Tabs>
     </SheetContent>
+  );
+}
+
+function StatusTabContent({
+  describe,
+  status,
+  statusMessage,
+  onRefresh,
+}: {
+  describe: ServiceDescribe;
+  status: Service["status"];
+  statusMessage: string | null;
+  onRefresh: () => void;
+}) {
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="rounded-md border border-border bg-canvas px-3 py-2">
+        <div className="flex items-center gap-2">
+          <StatusBadge status={status} />
+        </div>
+        {statusMessage && <p className="mt-1 text-xs text-muted">{statusMessage}</p>}
+      </div>
+
+      {describe?.kind === "kubernetes" && (
+        <>
+          <div>
+            <p className="mb-1.5 text-xs font-medium text-muted">Deployment</p>
+            {describe.deployment ? (
+              <MiniTable
+                columns={["Name", "Status", "Pods"]}
+                rows={[[
+                  describe.deployment.name,
+                  describe.deployment.status,
+                  `${describe.deployment.ready}/${describe.deployment.replicas}`,
+                ]]}
+              />
+            ) : (
+              <p className="text-xs text-muted">No Deployment found yet.</p>
+            )}
+          </div>
+          <div>
+            <p className="mb-1.5 text-xs font-medium text-muted">Pods</p>
+            {describe.pods.length > 0 ? (
+              <MiniTable
+                columns={["Name", "Status", "Restarts"]}
+                rows={describe.pods.map((p) => [p.name, p.status, String(p.restarts)])}
+              />
+            ) : (
+              <p className="text-xs text-muted">No pods scheduled yet.</p>
+            )}
+          </div>
+        </>
+      )}
+
+      {describe?.kind === "docker" && (
+        <MiniTable
+          columns={["Field", "Value"]}
+          rows={[
+            ["Image", describe.image ?? "—"],
+            ["State", describe.state ?? "—"],
+            ["Started at", describe.started_at ?? "—"],
+            ["Restart count", String(describe.restart_count ?? 0)],
+            ["Exit code", describe.exit_code !== null ? String(describe.exit_code) : "—"],
+            ...(describe.error ? [["Error", describe.error]] : []),
+          ]}
+        />
+      )}
+
+      {!describe && <p className="text-xs text-muted">No container/pod deployed yet.</p>}
+
+      <Button size="sm" variant="secondary" onClick={onRefresh} className="self-start">
+        <RefreshCw className="h-3.5 w-3.5" /> Refresh
+      </Button>
+    </div>
+  );
+}
+
+function MiniTable({ columns, rows }: { columns: string[]; rows: string[][] }) {
+  return (
+    <div className="overflow-x-auto rounded-md border border-border">
+      <table className="w-full text-left text-xs">
+        <thead>
+          <tr className="border-b border-border bg-canvas text-muted">
+            {columns.map((c) => (
+              <th key={c} className="px-3 py-1.5 font-medium">
+                {c}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, i) => (
+            <tr key={i} className="border-b border-border last:border-0">
+              {row.map((cell, j) => (
+                <td key={j} className="truncate px-3 py-1.5 font-mono text-ink">
+                  {cell}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }

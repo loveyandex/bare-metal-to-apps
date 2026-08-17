@@ -61,6 +61,9 @@ async fn main() -> anyhow::Result<()> {
             "/api/projects/:id",
             get(routes::projects::get_project).delete(routes::projects::delete_project),
         )
+        .route("/api/projects/:id/restart", post(routes::projects::restart_project))
+        .route("/api/projects/:id/redeploy", post(routes::projects::redeploy_project))
+        .route("/api/projects/:id/reset", post(routes::projects::reset_project))
         .route(
             "/api/projects/:id/services",
             post(routes::services::create_service),
@@ -70,6 +73,9 @@ async fn main() -> anyhow::Result<()> {
             get(routes::services::get_service).delete(routes::services::delete_service),
         )
         .route("/api/services/:id/redeploy", post(routes::services::redeploy_service))
+        .route("/api/services/:id/restart", post(routes::services::restart_service))
+        .route("/api/services/:id/describe", get(routes::services::describe_service))
+        .route("/api/services/:id/events", get(routes::services::list_events))
         .route("/api/services/:id/logs", get(routes::services::get_logs))
         .route(
             "/api/services/:id/env",

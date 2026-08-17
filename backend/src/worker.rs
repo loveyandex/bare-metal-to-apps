@@ -8,6 +8,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+/// How long we'll keep polling a freshly-started container/pod for it to
+/// become `Running` before giving up on this attempt. Image pulls from a
+/// registry like ghcr.io can legitimately take a couple of minutes on a slow
+/// connection or a large image — the old code gave up after ~2 seconds and
+/// reported "failed", which is what made a merely-slow pull look broken.
+const READY_TIMEOUT: Duration = Duration::from_secs(300);
+const POLL_INTERVAL: Duration = Duration::from_secs(3);
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
@@ -27,9 +35,9 @@ impl AppState {
 }
 
 /// Runs forever: drains the deploy queue (services that were just created or
-/// asked to redeploy) and separately polls running containers so crashes are
-/// noticed even without an explicit trigger. This is the "cron" that keeps
-/// retrying a service until it comes up healthy.
+/// asked to redeploy) and separately polls settled containers so drift
+/// (crashes, evictions) is noticed even without an explicit trigger. This is
+/// the "cron" that keeps retrying a service until it comes up healthy.
 pub async fn run(
     pool: PgPool,
     docker: Arc<dyn Orchestrator>,
@@ -154,7 +162,7 @@ async fn deploy_once(
     };
     env.retain(|_, v| !v.is_empty());
 
-    set_status(pool, hub, service_id, "creating", None).await;
+    set_status(pool, hub, service_id, "creating", Some("applying".to_string())).await;
 
     let container_name = if deploy_mode == DeployMode::Kubernetes.to_string() {
         svc.slug.clone()
@@ -180,17 +188,80 @@ async fn deploy_once(
         .execute(pool)
         .await?;
 
-    // Give the container a moment to either come up or crash immediately.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    match orchestrator.inspect(&container_id).await? {
-        ContainerState::Running => {
-            set_status(pool, hub, service_id, "running", None).await;
-            Ok(())
+    wait_until_ready(pool, orchestrator, hub, service_id, &container_id).await
+}
+
+/// Polls a just-started container/pod until it settles into a state worth
+/// reporting: `Running` (success), `CrashLoopBackOff` (deployed, but the app
+/// itself is unhealthy — retrying the deploy won't fix that), or a genuine
+/// failure to ever come up within `READY_TIMEOUT`. Everything in between
+/// (`Pending`, `ImagePullError`) is reported live as `pending` with whatever
+/// reason the orchestrator can tell us, and never counted as a failure on
+/// its own — only exhausting the timeout while still stuck there is.
+async fn wait_until_ready(
+    pool: &PgPool,
+    orchestrator: &dyn Orchestrator,
+    hub: &Hub,
+    service_id: Uuid,
+    container_id: &str,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+    let mut last_state: Option<ContainerState> = None;
+
+    loop {
+        let state = orchestrator.inspect(container_id).await?;
+        let changed = last_state.as_ref() != Some(&state);
+
+        match &state {
+            ContainerState::Running => {
+                set_status(pool, hub, service_id, "running", None).await;
+                return Ok(());
+            }
+            ContainerState::CrashLoopBackOff { restarts } => {
+                set_status(
+                    pool,
+                    hub,
+                    service_id,
+                    "crashed",
+                    Some(format!("crash-looping ({restarts} restarts)")),
+                )
+                .await;
+                return Ok(());
+            }
+            ContainerState::Exited { code } => {
+                anyhow::bail!("container exited immediately with code {code}");
+            }
+            ContainerState::NotFound => {
+                anyhow::bail!("container/pod disappeared while waiting to become ready");
+            }
+            ContainerState::Pending { reason } if changed => {
+                let msg = reason
+                    .clone()
+                    .map(|r| format!("waiting: {r}"))
+                    .unwrap_or_else(|| "waiting to start".to_string());
+                set_status(pool, hub, service_id, "pending", Some(msg)).await;
+            }
+            ContainerState::ImagePullError { reason } if changed => {
+                set_status(pool, hub, service_id, "pending", Some(format!("pulling image: {reason}"))).await;
+            }
+            ContainerState::Other(s) if changed => {
+                set_status(pool, hub, service_id, "pending", Some(format!("state: {s}"))).await;
+            }
+            _ => {} // unchanged Pending/ImagePullError/Other — avoid spamming the event log every poll tick
         }
-        ContainerState::Exited { code } => {
-            anyhow::bail!("container exited immediately with code {code}")
+
+        if tokio::time::Instant::now() >= deadline {
+            let detail = match &state {
+                ContainerState::Pending { reason } => reason.clone().unwrap_or_else(|| "pending".to_string()),
+                ContainerState::ImagePullError { reason } => format!("pulling image: {reason}"),
+                ContainerState::Other(s) => s.clone(),
+                other => format!("{other:?}"),
+            };
+            anyhow::bail!("still not ready after {}s (last state: {detail})", READY_TIMEOUT.as_secs());
         }
-        other => anyhow::bail!("unexpected container state after start: {other:?}"),
+
+        last_state = Some(state);
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -240,8 +311,10 @@ async fn set_status(pool: &PgPool, hub: &Hub, service_id: Uuid, status: &str, me
     }
 }
 
-/// Periodically checks every service with a container_id that we believe is
-/// `running` and reflects reality (e.g. the container crashed on its own).
+/// Periodically checks every service in a settled state (`running`,
+/// `crashed`, or a `pending` state left over from a backend restart mid-wait)
+/// and reflects reality — e.g. the container crashed on its own, or a
+/// Kubernetes pod got evicted and is scheduling again.
 async fn poll_loop(pool: PgPool, docker: Arc<dyn Orchestrator>, kubernetes: Arc<dyn Orchestrator>, hub: Hub) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
@@ -249,7 +322,7 @@ async fn poll_loop(pool: PgPool, docker: Arc<dyn Orchestrator>, kubernetes: Arc<
         let rows: Vec<(Uuid, String, String, String)> = match sqlx::query_as(
             "select s.id, s.container_id, s.status, p.deploy_mode
              from services s join projects p on p.id = s.project_id
-             where s.container_id is not null and s.status in ('running','crashed')",
+             where s.container_id is not null and s.status in ('running','crashed','pending')",
         )
         .fetch_all(&pool)
         .await
@@ -271,14 +344,22 @@ async fn poll_loop(pool: PgPool, docker: Arc<dyn Orchestrator>, kubernetes: Arc<
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let new_status = match state {
-                ContainerState::Running => "running",
-                ContainerState::Exited { .. } => "crashed",
-                ContainerState::NotFound => "crashed",
-                ContainerState::Other(_) => "crashed",
+            let (new_status, message): (&str, Option<String>) = match &state {
+                ContainerState::Running => ("running", None),
+                ContainerState::CrashLoopBackOff { restarts } => {
+                    ("crashed", Some(format!("crash-looping ({restarts} restarts)")))
+                }
+                ContainerState::Exited { code } => ("crashed", Some(format!("exited with code {code}"))),
+                ContainerState::NotFound => ("crashed", Some("container/pod not found".to_string())),
+                ContainerState::Pending { reason } => (
+                    "pending",
+                    Some(reason.clone().map(|r| format!("waiting: {r}")).unwrap_or_else(|| "waiting to start".to_string())),
+                ),
+                ContainerState::ImagePullError { reason } => ("pending", Some(format!("pulling image: {reason}"))),
+                ContainerState::Other(s) => ("crashed", Some(format!("state: {s}"))),
             };
             if new_status != prev_status {
-                set_status(&pool, &hub, service_id, new_status, None).await;
+                set_status(&pool, &hub, service_id, new_status, message).await;
             }
         }
     }

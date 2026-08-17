@@ -146,6 +146,9 @@ impl DbEngine {
 #[serde(rename_all = "lowercase")]
 pub enum ServiceStatus {
     Creating,
+    /// Scheduled/started but not serving yet — normal while an image is
+    /// pulling or a pod is starting up. Not an error state.
+    Pending,
     Running,
     Crashed,
     Failed,
@@ -157,6 +160,7 @@ impl std::fmt::Display for ServiceStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             ServiceStatus::Creating => "creating",
+            ServiceStatus::Pending => "pending",
             ServiceStatus::Running => "running",
             ServiceStatus::Crashed => "crashed",
             ServiceStatus::Failed => "failed",
@@ -172,6 +176,7 @@ impl std::str::FromStr for ServiceStatus {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "creating" => ServiceStatus::Creating,
+            "pending" => ServiceStatus::Pending,
             "running" => ServiceStatus::Running,
             "crashed" => ServiceStatus::Crashed,
             "failed" => ServiceStatus::Failed,
@@ -217,6 +222,15 @@ pub struct EnvVarMasked {
     pub value: Option<String>,
     pub is_secret: bool,
     pub is_generated: bool,
+}
+
+#[derive(Debug, Serialize, Clone, sqlx::FromRow)]
+pub struct DeployEvent {
+    pub id: Uuid,
+    pub service_id: Uuid,
+    pub status: String,
+    pub message: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 impl From<EnvVar> for EnvVarMasked {

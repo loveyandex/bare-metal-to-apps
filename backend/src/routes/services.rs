@@ -1,6 +1,6 @@
 use super::projects::internal;
 use crate::dbprovision;
-use crate::models::{DbEngine, DeploySource, EnvVar, EnvVarMasked, PortMapping, Service};
+use crate::models::{DbEngine, DeployEvent, DeploySource, EnvVar, EnvVarMasked, PortMapping, Service};
 use crate::worker::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -236,6 +236,75 @@ pub async fn get_logs(
         .await
         .map_err(internal)?;
     Ok(Json(logs))
+}
+
+/// In-place restart of whatever's already running — no re-apply of the spec
+/// or image, just cycle the process. Distinct from `redeploy_service`, which
+/// re-applies the full spec (picks up a new image tag, env var changes,
+/// port changes, ...).
+pub async fn restart_service(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let row: Option<(Option<String>, String)> = sqlx::query_as(
+        "select s.container_id, p.deploy_mode from services s join projects p on p.id = s.project_id where s.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(internal)?;
+    let Some((Some(cid), deploy_mode)) = row else {
+        return Err((StatusCode::CONFLICT, "service has no running container/pod to restart".to_string()));
+    };
+    state
+        .orchestrator_for(&deploy_mode)
+        .restart(&cid)
+        .await
+        .map_err(internal)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Orchestrator-specific structured status detail for the UI: on Kubernetes,
+/// the Deployment's rollout status plus its Pods (mirroring `kubectl get
+/// deployment,pods`); on Docker, the container inspect summary.
+pub async fn describe_service(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let row: Option<(Option<String>, String)> = sqlx::query_as(
+        "select s.container_id, p.deploy_mode from services s join projects p on p.id = s.project_id where s.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(internal)?;
+    let Some((Some(cid), deploy_mode)) = row else {
+        return Ok(Json(serde_json::json!(null)));
+    };
+    let detail = state
+        .orchestrator_for(&deploy_mode)
+        .describe(&cid)
+        .await
+        .map_err(internal)?;
+    Ok(Json(detail))
+}
+
+/// Recent status transitions for this service — the "event matrix": every
+/// `creating` → `pending: waiting: ContainerCreating` → `running` (or
+/// `failed`) step the reconciliation worker recorded, newest first.
+pub async fn list_events(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<DeployEvent>>, (StatusCode, String)> {
+    let events: Vec<DeployEvent> = sqlx::query_as(
+        "select id, service_id, status, message, created_at from deploy_events
+         where service_id = $1 order by created_at desc limit 100",
+    )
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(events))
 }
 
 #[derive(Deserialize)]

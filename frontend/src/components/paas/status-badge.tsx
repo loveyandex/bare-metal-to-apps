@@ -4,6 +4,8 @@ import { Loader2 } from "lucide-react";
 
 const STYLES: Record<ServiceStatus, { variant: "default" | "success" | "warning" | "danger" | "muted"; label: string }> = {
   creating: { variant: "warning", label: "Deploying" },
+  // Not an error: still legitimately scheduling / pulling the image / starting.
+  pending: { variant: "warning", label: "Pending" },
   running: { variant: "success", label: "Running" },
   crashed: { variant: "danger", label: "Crashed" },
   failed: { variant: "danger", label: "Failed" },
@@ -11,11 +13,13 @@ const STYLES: Record<ServiceStatus, { variant: "default" | "success" | "warning"
   deleting: { variant: "muted", label: "Deleting" },
 };
 
+const SPINNING: ServiceStatus[] = ["creating", "pending"];
+
 export function StatusBadge({ status }: { status: ServiceStatus }) {
   const style = STYLES[status] ?? STYLES.stopped;
   return (
     <Badge variant={style.variant}>
-      {status === "creating" ? (
+      {SPINNING.includes(status) ? (
         <Loader2 className="h-3 w-3 animate-spin" />
       ) : (
         <span
