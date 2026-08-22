@@ -11,6 +11,7 @@ import { DeployModeBadge } from "@/components/paas/deploy-mode-badge";
 import { ServiceNode } from "@/components/paas/service-node";
 import { CreateServiceDialog } from "@/components/paas/create-service-dialog";
 import { ServicePanel } from "@/components/paas/service-panel";
+import type { LinkSuggestionSource } from "@/components/paas/variable-value-input";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { ChevronDown, Plus, RefreshCw, RotateCcw, RotateCw, Trash2 } from "lucide-react";
@@ -86,6 +87,15 @@ export default function ProjectPage({ params }: PageProps<"/project/[id]">) {
 
   const edges: Edge[] = useMemo(
     () => linkEdges(project?.services ?? [], envByService),
+    [project, envByService],
+  );
+
+  const linkSuggestions: LinkSuggestionSource[] = useMemo(
+    () =>
+      (project?.services ?? []).map((s) => ({
+        slug: s.slug,
+        keys: (envByService[s.id] ?? []).map((v) => v.key),
+      })),
     [project, envByService],
   );
 
@@ -217,6 +227,7 @@ export default function ProjectPage({ params }: PageProps<"/project/[id]">) {
       <ServicePanel
         service={activeService}
         deployMode={project.deploy_mode}
+        linkSuggestions={linkSuggestions}
         onOpenChange={(open) => !open && setActiveServiceId(null)}
         onDeleted={() => {
           setActiveServiceId(null);

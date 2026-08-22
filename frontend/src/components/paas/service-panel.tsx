@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { StatusBadge } from "@/components/paas/status-badge";
+import { VariableValueInput, type LinkSuggestionSource } from "@/components/paas/variable-value-input";
 import {
   api,
   type DeployEvent,
@@ -21,18 +22,26 @@ import { Eye, EyeOff, Plus, RefreshCw, RotateCw, Trash2, X } from "lucide-react"
 export function ServicePanel({
   service,
   deployMode,
+  linkSuggestions,
   onOpenChange,
   onDeleted,
 }: {
   service: Service | null;
   deployMode: DeployMode;
+  linkSuggestions: LinkSuggestionSource[];
   onOpenChange: (open: boolean) => void;
   onDeleted: () => void;
 }) {
   return (
     <Sheet open={!!service} onOpenChange={onOpenChange}>
       {service && (
-        <ServicePanelContent key={service.id} service={service} deployMode={deployMode} onDeleted={onDeleted} />
+        <ServicePanelContent
+          key={service.id}
+          service={service}
+          deployMode={deployMode}
+          linkSuggestions={linkSuggestions.filter((s) => s.slug !== service.slug)}
+          onDeleted={onDeleted}
+        />
       )}
     </Sheet>
   );
@@ -41,10 +50,12 @@ export function ServicePanel({
 function ServicePanelContent({
   service,
   deployMode,
+  linkSuggestions,
   onDeleted,
 }: {
   service: Service;
   deployMode: DeployMode;
+  linkSuggestions: LinkSuggestionSource[];
   onDeleted: () => void;
 }) {
   const [envVars, setEnvVars] = useState<EnvVarMasked[]>([]);
@@ -118,11 +129,20 @@ function ServicePanelContent({
     try {
       const updated = await api.setEnvRaw(service.id, rawText);
       setEnvVars(updated);
-      setRawText("");
       setRawMode(false);
     } finally {
       setBusy(false);
     }
+  }
+
+  async function enterRawMode() {
+    // Prefill with the current vars (including real secret values, revealed
+    // the same way the eye icon does) so raw mode is an editable snapshot
+    // you can append to, not a blank box that silently drops everything not
+    // re-typed.
+    const full = await api.listEnv(service.id, true);
+    setRawText(full.map((v) => `${v.key}=${v.value ?? ""}`).join("\n"));
+    setRawMode(true);
   }
 
   async function removeVar(id: string) {
@@ -230,7 +250,7 @@ function ServicePanelContent({
               {rawMode ? "Paste a .env block" : "Variables"}
             </p>
             <button
-              onClick={() => setRawMode((v) => !v)}
+              onClick={() => (rawMode ? setRawMode(false) : enterRawMode())}
               className="text-xs text-primary hover:underline"
             >
               {rawMode ? "Form editor" : "Raw editor"}
@@ -292,11 +312,17 @@ function ServicePanelContent({
                   <code className="rounded bg-surface-2 px-1 py-0.5">{"${{service-slug.KEY}}"}</code>
                 </p>
                 <div className="flex gap-2">
-                  <Input placeholder="KEY" value={newKey} onChange={(e) => setNewKey(e.target.value)} />
                   <Input
+                    className="flex-1"
+                    placeholder="KEY"
+                    value={newKey}
+                    onChange={(e) => setNewKey(e.target.value)}
+                  />
+                  <VariableValueInput
                     placeholder="value or ${{postgres.DATABASE_URL}}"
                     value={newValue}
-                    onChange={(e) => setNewValue(e.target.value)}
+                    onChange={setNewValue}
+                    suggestions={linkSuggestions}
                   />
                   <Button size="icon" onClick={addVar} disabled={busy || !newKey.trim()}>
                     <Plus className="h-4 w-4" />
